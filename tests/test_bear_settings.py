@@ -1,4 +1,10 @@
-from bear_settings import DEFAULT_CONFIG, get_theme, normalize_config, should_limit_app
+from bear_settings import (
+    DEFAULT_CONFIG,
+    app_checkbox_text,
+    get_theme,
+    normalize_config,
+    should_limit_app,
+)
 
 
 def test_normalize_config_migrates_existing_config_with_new_defaults():
@@ -47,3 +53,8 @@ def test_dark_theme_uses_dark_background_and_readable_foreground():
     assert theme["bg"] == "#12161c"
     assert theme["fg"] == "#f2f4f8"
     assert theme["entry_bg"] != theme["fg"]
+
+
+def test_app_checkbox_text_shows_an_x_when_selected():
+    assert app_checkbox_text("Music.EXE", checked=True, is_running=True) == "☒  Music.EXE"
+    assert app_checkbox_text("game.exe", checked=False, is_running=False) == "☐  game.exe  (saved)"

@@ -12,7 +12,13 @@ import pystray
 from pystray import MenuItem as item
 import sys
 
-from bear_settings import DEFAULT_CONFIG, get_theme, normalize_config, should_limit_app
+from bear_settings import (
+    DEFAULT_CONFIG,
+    app_checkbox_text,
+    get_theme,
+    normalize_config,
+    should_limit_app,
+)
 
 # --- APP DATA SETUP ---
 APP_FOLDER = os.path.join(os.getenv("APPDATA"), "Bear_AudioLimiter")
@@ -228,6 +234,11 @@ def apply_theme(win, dark_mode=None):
                 selectforeground=theme["fg"], highlightbackground=theme["muted_fg"],
                 highlightcolor=theme["accent"],
             )
+        elif isinstance(widget, tk.Canvas):
+            widget.configure(
+                bg=theme["surface"], highlightbackground=theme["muted_fg"],
+                highlightcolor=theme["accent"],
+            )
         for child in widget.winfo_children():
             style_widget(child)
 
@@ -298,35 +309,62 @@ def _create_settings_win():
         font=("Arial", 8), wraplength=430, justify="left",
     ).pack(anchor="w", pady=(0, 5))
 
+    dark_var = tk.BooleanVar(value=config["DARK_MODE"])
     list_frame = tk.Frame(content)
     list_frame.pack(fill="both", expand=True)
-    app_list = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, exportselection=False, height=7)
-    app_scrollbar = tk.Scrollbar(list_frame, command=app_list.yview)
-    app_list.configure(yscrollcommand=app_scrollbar.set)
-    app_list.pack(side="left", fill="both", expand=True)
+    app_canvas = tk.Canvas(list_frame, height=155, highlightthickness=1)
+    app_scrollbar = tk.Scrollbar(list_frame, command=app_canvas.yview)
+    checklist_frame = tk.Frame(app_canvas)
+    checklist_window = app_canvas.create_window((0, 0), window=checklist_frame, anchor="nw")
+    app_canvas.configure(yscrollcommand=app_scrollbar.set)
+    app_canvas.pack(side="left", fill="both", expand=True)
     app_scrollbar.pack(side="right", fill="y")
 
+    checklist_frame.bind(
+        "<Configure>", lambda event: app_canvas.configure(scrollregion=app_canvas.bbox("all")),
+    )
+    app_canvas.bind(
+        "<Configure>", lambda event: app_canvas.itemconfigure(checklist_window, width=event.width),
+    )
+
     shown_apps = []
+    app_vars = {}
 
     def populate_apps():
-        nonlocal shown_apps
-        currently_selected = {
-            shown_apps[index] for index in app_list.curselection() if index < len(shown_apps)
+        nonlocal shown_apps, app_vars
+        selected_folded = {
+            name.casefold() for name, variable in app_vars.items() if variable.get()
         }
-        if not shown_apps:
-            currently_selected.update(config.get("SELECTED_APPS", []))
+        if not app_vars:
+            selected_folded.update(name.casefold() for name in config.get("SELECTED_APPS", []))
+
         running_apps = get_running_audio_apps()
         shown_apps = sorted(
             set(running_apps) | set(config.get("SELECTED_APPS", [])), key=str.casefold,
         )
-        app_list.delete(0, tk.END)
         running_folded = {name.casefold() for name in running_apps}
-        selected_folded = {name.casefold() for name in currently_selected}
-        for index, app_name in enumerate(shown_apps):
-            suffix = "" if app_name.casefold() in running_folded else "  (saved)"
-            app_list.insert(tk.END, app_name + suffix)
-            if app_name.casefold() in selected_folded:
-                app_list.selection_set(index)
+
+        for child in checklist_frame.winfo_children():
+            child.destroy()
+        app_vars = {}
+
+        for app_name in shown_apps:
+            is_running = app_name.casefold() in running_folded
+            variable = tk.BooleanVar(value=app_name.casefold() in selected_folded)
+            app_vars[app_name] = variable
+            row = tk.Checkbutton(
+                checklist_frame, variable=variable, indicatoron=False, anchor="w",
+                padx=8, pady=4, relief="flat", bd=0, font=("Arial", 9),
+            )
+
+            def update_row(button=row, name=app_name, state=variable, running_now=is_running):
+                button.configure(text=app_checkbox_text(name, state.get(), running_now))
+
+            row.configure(command=update_row)
+            update_row()
+            row.pack(fill="x", anchor="w")
+
+        apply_theme(settings_win, dark_var.get())
 
     def auto_refresh_apps():
         if settings_win.winfo_exists():
@@ -335,8 +373,6 @@ def _create_settings_win():
 
     populate_apps()
     tk.Button(content, text="Refresh open apps", command=populate_apps).pack(fill="x", pady=(5, 8))
-
-    dark_var = tk.BooleanVar(value=config["DARK_MODE"])
 
     def preview_theme():
         apply_theme(settings_win, dark_var.get())
@@ -349,7 +385,7 @@ def _create_settings_win():
     def save():
         config["USE_MUTE"] = mute_var.get()
         config["LIMIT_ONLY_SELECTED"] = only_selected_var.get()
-        config["SELECTED_APPS"] = [shown_apps[index] for index in app_list.curselection()]
+        config["SELECTED_APPS"] = [name for name in shown_apps if app_vars[name].get()]
         config["DARK_MODE"] = dark_var.get()
         save_config(config)
         settings_win.destroy()

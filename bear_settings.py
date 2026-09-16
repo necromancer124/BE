@@ -53,3 +53,10 @@ def should_limit_app(app_name, config):
 def get_theme(dark_mode):
     """Return a copy of the requested UI color palette."""
     return (DARK_THEME if dark_mode else LIGHT_THEME).copy()
+
+
+def app_checkbox_text(app_name, checked, is_running):
+    """Format a clickable checklist row with a visible boxed X."""
+    box = "☒" if checked else "☐"
+    saved_suffix = "" if is_running else "  (saved)"
+    return f"{box}  {app_name}{saved_suffix}"
