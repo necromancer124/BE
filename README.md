@@ -6,6 +6,9 @@ Bear Audio Limiter calculates the real output volume by multiplying the **Peak V
 
 ## ✨ Features
 - **Real-time Monitoring**: Tracks the actual output of every running application.
+- **Selective App Limiting**: Optionally protect only the apps you select; saved apps remain selected across restarts.
+- **Live App Discovery**: Open audio apps automatically appear in Settings while the window is open.
+- **Light and Dark Modes**: Choose a persistent interface theme.
 - **Predictive Protection**: Instantly reacts to audio spikes before they hit your ears.
 - **Customizable Thresholds**: Adjust trigger levels, safe return levels, and mute durations.
 - **System Tray Integration**: Runs quietly in the background with a monitor window for real-time stats.
@@ -25,6 +28,8 @@ The app saves your settings in `%APPDATA%/Bear_AudioLimiter/config.json`.
 - **Threshold**: The volume level that triggers protection.
 - **Safe Level**: The volume level that must be reached before restoring original volume.
 - **Mute Duration**: How long to hold the volume low.
+- **Only limit selected apps**: Enable this in Settings, then choose from current audio apps. Click **Refresh open apps** or leave Settings open for automatic refresh.
+- **Dark mode**: Enable the persistent dark interface from Settings.
 
 ## 📜 License
 This project is licensed under the MIT License.

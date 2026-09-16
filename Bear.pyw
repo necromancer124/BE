@@ -12,34 +12,34 @@ import pystray
 from pystray import MenuItem as item
 import sys
 
+from bear_settings import DEFAULT_CONFIG, get_theme, normalize_config, should_limit_app
+
 # --- APP DATA SETUP ---
-APP_FOLDER = os.path.join(os.getenv('APPDATA'), 'Bear_AudioLimiter')
-CONFIG_FILE = os.path.join(APP_FOLDER, 'config.json')
-ICON_PATH = "icon.png"  # Make sure your icon is named this!
-
-DEFAULT_CONFIG = {
-    "THRESHOLD": 0.20,
-    "SAFE_LEVEL": 0.15,
-    "MUTE_DURATION": 1.5,
-    "USE_MUTE": False,
-    "LOWER_PERCENT": 0.10
-}
-
-
-def load_config():
-    if not os.path.exists(APP_FOLDER): os.makedirs(APP_FOLDER)
-    if not os.path.exists(CONFIG_FILE):
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return DEFAULT_CONFIG
+APP_FOLDER = os.path.join(os.getenv("APPDATA"), "Bear_AudioLimiter")
+CONFIG_FILE = os.path.join(APP_FOLDER, "config.json")
 
 
 def save_config(config_to_save):
-    with open(CONFIG_FILE, 'w') as f: json.dump(config_to_save, f, indent=4)
+    os.makedirs(APP_FOLDER, exist_ok=True)
+    with open(CONFIG_FILE, "w") as config_file:
+        json.dump(config_to_save, config_file, indent=4)
+
+
+def load_config():
+    os.makedirs(APP_FOLDER, exist_ok=True)
+    if not os.path.exists(CONFIG_FILE):
+        fresh_config = normalize_config(DEFAULT_CONFIG)
+        save_config(fresh_config)
+        return fresh_config
+    try:
+        with open(CONFIG_FILE, "r") as config_file:
+            saved_config = json.load(config_file)
+        migrated_config = normalize_config(saved_config)
+        if migrated_config != saved_config:
+            save_config(migrated_config)
+        return migrated_config
+    except (OSError, ValueError, TypeError):
+        return normalize_config(DEFAULT_CONFIG)
 
 
 config = load_config()
@@ -52,16 +52,39 @@ tk_icon = None
 
 
 # --- ICON LOADER ---
+def resource_path(relative_path):
+    """Get an absolute resource path in development and PyInstaller builds."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
 def load_my_icon():
-    """Loads your custom icon.png file using the resource_path."""
-    # Use resource_path to find the file inside the compiled EXE
-    path = resource_path("icon.png") 
-    
+    """Load Bear's tray/window icon, with a simple fallback."""
+    path = resource_path("icon.png")
     if os.path.exists(path):
         return Image.open(path)
-    else:
-        # Fallback to a simple colored square if file is missing
-        return Image.new('RGB', (64, 64), color=(255, 140, 0))
+    return Image.new("RGB", (64, 64), color=(255, 140, 0))
+
+
+# --- APP SELECTION ---
+def get_running_audio_apps():
+    """Return the executable names that currently own Windows audio sessions."""
+    pythoncom.CoInitialize()
+    try:
+        names = {
+            session.Process.name()
+            for session in AudioUtilities.GetAllSessions()
+            if session.Process
+        }
+        return sorted(names, key=str.casefold)
+    except Exception:
+        return []
+    finally:
+        pythoncom.CoUninitialize()
+
 
 # --- THE LOGIC (Prediction & Protection) ---
 def limiter_logic():
@@ -84,8 +107,16 @@ def limiter_logic():
             is_defending = False
 
             for session in sessions:
-                if not session.Process: continue
+                if not session.Process:
+                    continue
                 name = session.Process.name()
+
+                # Unselected apps are ignored. If an app was already being defended
+                # when settings changed, let the original recovery logic finish.
+                was_defending = name in app_states and app_states[name][2]
+                if not should_limit_app(name, config) and not was_defending:
+                    continue
+
                 meter = session._ctl.QueryInterface(IAudioMeterInformation)
                 volume_control = session._ctl.QueryInterface(ISimpleAudioVolume)
 
@@ -93,7 +124,8 @@ def limiter_logic():
                 app_mixer = volume_control.GetMasterVolume()
                 true_actual = raw_peak * app_mixer * global_master
 
-                if name not in app_states: app_states[name] = [app_mixer, 0, False, 0]
+                if name not in app_states:
+                    app_states[name] = [app_mixer, 0, False, 0]
 
                 if not app_states[name][2] and true_actual > config["THRESHOLD"]:
                     app_states[name][0] = app_mixer
@@ -121,7 +153,8 @@ def limiter_logic():
                         if potential_volume < config["SAFE_LEVEL"]:
                             app_states[name][3] += 1
                             if app_states[name][3] >= 50:
-                                if config["USE_MUTE"]: volume_control.SetMute(0, None)
+                                if config["USE_MUTE"]:
+                                    volume_control.SetMute(0, None)
 
                                 start_v = config["LOWER_PERCENT"] if not config["USE_MUTE"] else 0.001
                                 end_v = app_states[name][0]
@@ -133,29 +166,76 @@ def limiter_logic():
                                 app_states[name][2], app_states[name][3] = False, 0
                         else:
                             app_states[name][3] = 0
-                else:
-                    if true_actual > max_view_level:
-                        max_view_level = true_actual
-                        current_loudest = name
+                elif true_actual > max_view_level:
+                    max_view_level = true_actual
+                    current_loudest = name
 
-            if max_vol_var: max_vol_var.set(int(max_view_level * 100))
-            if loudest_app_var: loudest_app_var.set(current_loudest)
-            if status_var: status_var.set("⚠️ DEFENDING" if is_defending else "✅ OK")
+            if max_vol_var:
+                max_vol_var.set(int(max_view_level * 100))
+            if loudest_app_var:
+                loudest_app_var.set(current_loudest)
+            if status_var:
+                status_var.set("⚠️ DEFENDING" if is_defending else "✅ OK")
 
-        except:
+        except Exception:
             pass
         time.sleep(0.05)
     pythoncom.CoUninitialize()
 
 
-# --- UI WINDOWS ---
+# --- UI THEMING ---
 def apply_icon(win):
-    """Utility to set your custom icon to any popup window."""
     global tk_icon
     if tk_icon:
         win.iconphoto(False, tk_icon)
 
 
+def apply_theme(win, dark_mode=None):
+    """Apply the selected light/dark palette to a window and its children."""
+    theme = get_theme(config["DARK_MODE"] if dark_mode is None else dark_mode)
+    win.configure(bg=theme["bg"])
+
+    style = ttk.Style(win)
+    style.configure(
+        "Bear.Horizontal.TScale",
+        background=theme["surface"],
+        troughcolor=theme["entry_bg"],
+    )
+    style.configure(
+        "Bear.Horizontal.TProgressbar",
+        background=theme["accent"],
+        troughcolor=theme["entry_bg"],
+    )
+
+    def style_widget(widget):
+        if isinstance(widget, (tk.Frame, tk.Toplevel)):
+            widget.configure(bg=theme["bg"] if isinstance(widget, tk.Toplevel) else theme["surface"])
+        elif isinstance(widget, tk.Label):
+            widget.configure(bg=theme["surface"], fg=theme["fg"])
+        elif isinstance(widget, tk.Checkbutton):
+            widget.configure(
+                bg=theme["surface"], fg=theme["fg"], selectcolor=theme["entry_bg"],
+                activebackground=theme["surface"], activeforeground=theme["fg"],
+            )
+        elif isinstance(widget, tk.Button):
+            widget.configure(
+                bg=theme["accent"], fg="#ffffff", activebackground=theme["accent"],
+                activeforeground="#ffffff", relief="flat",
+            )
+        elif isinstance(widget, tk.Listbox):
+            widget.configure(
+                bg=theme["entry_bg"], fg=theme["fg"], selectbackground=theme["select_bg"],
+                selectforeground=theme["fg"], highlightbackground=theme["muted_fg"],
+                highlightcolor=theme["accent"],
+            )
+        for child in widget.winfo_children():
+            style_widget(child)
+
+    for child in win.winfo_children():
+        style_widget(child)
+
+
+# --- SETTINGS WINDOW ---
 def open_settings():
     root.after(0, _create_settings_win)
 
@@ -163,59 +243,129 @@ def open_settings():
 def _create_settings_win():
     settings_win = tk.Toplevel(root)
     settings_win.title("Bear Settings")
-    settings_win.geometry("400x520")
+    settings_win.geometry("500x700")
+    settings_win.minsize(460, 640)
     settings_win.attributes("-topmost", True)
+    settings_win.configure(padx=20, pady=16)
     apply_icon(settings_win)
-    settings_win.configure(padx=20, pady=20)
+
+    content = tk.Frame(settings_win, padx=12, pady=8)
+    content.pack(fill="both", expand=True)
+
+    tk.Label(content, text="Audio protection", font=("Arial", 13, "bold")).pack(anchor="w", pady=(0, 4))
 
     def add_setting(label_text, key, from_val, to_val, is_percent=True):
-        frame = tk.Frame(settings_win)
-        frame.pack(fill="x", pady=10)
+        frame = tk.Frame(content)
+        frame.pack(fill="x", pady=5)
         display_val = int(config[key] * 100) if is_percent else config[key]
         suffix = "%" if is_percent else "s"
-        lbl = tk.Label(frame, text=f"{label_text}: {display_val}{suffix}", font=("Arial", 10, "bold"))
-        lbl.pack(side="top", anchor="w")
-        var = tk.DoubleVar(value=config[key])
+        label = tk.Label(frame, text=f"{label_text}: {display_val}{suffix}", font=("Arial", 9, "bold"))
+        label.pack(side="top", anchor="w")
+        variable = tk.DoubleVar(value=config[key])
 
-        def update_lbl(val):
-            v = float(val)
-            config[key] = v
-            lbl.config(text=f"{label_text}: {int(v * 100) if is_percent else round(v, 1)}{suffix}")
+        def update_label(value):
+            parsed_value = float(value)
+            config[key] = parsed_value
+            shown_value = int(parsed_value * 100) if is_percent else round(parsed_value, 1)
+            label.config(text=f"{label_text}: {shown_value}{suffix}")
 
-        ttk.Scale(frame, from_=from_val, to=to_val, variable=var, orient="horizontal", command=update_lbl).pack(
-            fill="x")
+        ttk.Scale(
+            frame, from_=from_val, to=to_val, variable=variable,
+            orient="horizontal", command=update_label, style="Bear.Horizontal.TScale",
+        ).pack(fill="x")
 
     add_setting("Trigger Threshold", "THRESHOLD", 0.01, 1.0)
     add_setting("Safe Level (Return volume below this)", "SAFE_LEVEL", 0.01, 1.0)
     add_setting("Drop Volume To (If not muting)", "LOWER_PERCENT", 0.0, 0.5)
     add_setting("Mute Duration (Seconds)", "MUTE_DURATION", 0.1, 5.0, is_percent=False)
 
-    m_var = tk.BooleanVar(value=config['USE_MUTE'])
-    tk.Checkbutton(settings_win, text="Mute completely on spike?", variable=m_var, font=("Arial", 9)).pack(pady=10,
-                                                                                                           anchor="w")
+    mute_var = tk.BooleanVar(value=config["USE_MUTE"])
+    tk.Checkbutton(
+        content, text="Mute completely on spike", variable=mute_var, font=("Arial", 9),
+    ).pack(anchor="w", pady=(6, 8))
+
+    tk.Label(content, text="App selection", font=("Arial", 13, "bold")).pack(anchor="w", pady=(4, 2))
+    only_selected_var = tk.BooleanVar(value=config["LIMIT_ONLY_SELECTED"])
+    tk.Checkbutton(
+        content,
+        text="Only limit the apps selected below",
+        variable=only_selected_var,
+        font=("Arial", 9, "bold"),
+    ).pack(anchor="w")
+    tk.Label(
+        content,
+        text="Open an app that plays audio and it will appear here. Selections are saved for next time.",
+        font=("Arial", 8), wraplength=430, justify="left",
+    ).pack(anchor="w", pady=(0, 5))
+
+    list_frame = tk.Frame(content)
+    list_frame.pack(fill="both", expand=True)
+    app_list = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, exportselection=False, height=7)
+    app_scrollbar = tk.Scrollbar(list_frame, command=app_list.yview)
+    app_list.configure(yscrollcommand=app_scrollbar.set)
+    app_list.pack(side="left", fill="both", expand=True)
+    app_scrollbar.pack(side="right", fill="y")
+
+    shown_apps = []
+
+    def populate_apps():
+        nonlocal shown_apps
+        currently_selected = {
+            shown_apps[index] for index in app_list.curselection() if index < len(shown_apps)
+        }
+        if not shown_apps:
+            currently_selected.update(config.get("SELECTED_APPS", []))
+        running_apps = get_running_audio_apps()
+        shown_apps = sorted(
+            set(running_apps) | set(config.get("SELECTED_APPS", [])), key=str.casefold,
+        )
+        app_list.delete(0, tk.END)
+        running_folded = {name.casefold() for name in running_apps}
+        selected_folded = {name.casefold() for name in currently_selected}
+        for index, app_name in enumerate(shown_apps):
+            suffix = "" if app_name.casefold() in running_folded else "  (saved)"
+            app_list.insert(tk.END, app_name + suffix)
+            if app_name.casefold() in selected_folded:
+                app_list.selection_set(index)
+
+    def auto_refresh_apps():
+        if settings_win.winfo_exists():
+            populate_apps()
+            settings_win.after(2000, auto_refresh_apps)
+
+    populate_apps()
+    tk.Button(content, text="Refresh open apps", command=populate_apps).pack(fill="x", pady=(5, 8))
+
+    dark_var = tk.BooleanVar(value=config["DARK_MODE"])
+
+    def preview_theme():
+        apply_theme(settings_win, dark_var.get())
+
+    tk.Checkbutton(
+        content, text="Dark mode", variable=dark_var, command=preview_theme,
+        font=("Arial", 9, "bold"),
+    ).pack(anchor="w", pady=(0, 5))
 
     def save():
-        config["USE_MUTE"] = m_var.get()
+        config["USE_MUTE"] = mute_var.get()
+        config["LIMIT_ONLY_SELECTED"] = only_selected_var.get()
+        config["SELECTED_APPS"] = [shown_apps[index] for index in app_list.curselection()]
+        config["DARK_MODE"] = dark_var.get()
         save_config(config)
         settings_win.destroy()
 
-    tk.Button(settings_win, text="Save & Close", command=save, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"),
-              pady=10).pack(fill="x", pady=20)
+    tk.Button(
+        content, text="Save & Close", command=save, font=("Arial", 10, "bold"), pady=9,
+    ).pack(fill="x")
+
+    apply_theme(settings_win, dark_var.get())
+    settings_win.after(2000, auto_refresh_apps)
 
 
+# --- MONITOR WINDOW ---
 def show_monitor():
     root.after(0, _create_monitor_win)
-    
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
 
-# Example of how to use it in your code:
-# logo_image = Image.open(resource_path("Bear_logo.png"))
 
 def _create_monitor_win():
     global max_vol_var, loudest_app_var, status_var
@@ -223,37 +373,45 @@ def _create_monitor_win():
     monitor_win.title("Bear Monitor")
     monitor_win.geometry("320x220")
     monitor_win.attributes("-topmost", True)
-    apply_icon(monitor_win)
     monitor_win.configure(padx=15, pady=15)
+    apply_icon(monitor_win)
+
+    panel = tk.Frame(monitor_win, padx=10, pady=8)
+    panel.pack(fill="both", expand=True)
 
     status_var = tk.StringVar(value="✅ OK")
-    status_lbl = tk.Label(monitor_win, textvariable=status_var, font=("Arial", 14, "bold"))
-    status_lbl.pack()
+    status_label = tk.Label(panel, textvariable=status_var, font=("Arial", 14, "bold"))
+    status_label.pack()
 
-    tk.Label(monitor_win, text="Loudest App:", font=("Arial", 9, "italic")).pack(pady=(10, 0))
+    tk.Label(panel, text="Loudest App:", font=("Arial", 9, "italic")).pack(pady=(10, 0))
     loudest_app_var = tk.StringVar(value="None")
-    tk.Label(monitor_win, textvariable=loudest_app_var, font=("Arial", 11, "bold"), fg="#333").pack()
+    tk.Label(panel, textvariable=loudest_app_var, font=("Arial", 11, "bold")).pack()
 
     max_vol_var = tk.IntVar(value=0)
-    num_lbl = tk.Label(monitor_win, text="0%", font=("Arial", 22, "bold"))
-    num_lbl.pack(pady=5)
+    number_label = tk.Label(panel, text="0%", font=("Arial", 22, "bold"))
+    number_label.pack(pady=5)
 
-    progress = ttk.Progressbar(monitor_win, length=280, variable=max_vol_var, maximum=100)
+    progress = ttk.Progressbar(
+        panel, length=280, variable=max_vol_var, maximum=100,
+        style="Bear.Horizontal.TProgressbar",
+    )
     progress.pack()
 
+    apply_theme(monitor_win)
+    theme = get_theme(config["DARK_MODE"])
+
     def update_ui():
-        if not running: 
+        if not running or not monitor_win.winfo_exists():
             return
-            
         if max_vol_var and status_var:
-            val = max_vol_var.get()
-            num_lbl.config(text=f"{val}%")
+            value = max_vol_var.get()
+            number_label.config(text=f"{value}%")
             if "DEFENDING" in status_var.get():
-                status_lbl.config(fg="red")
-                num_lbl.config(fg="red")
+                status_label.config(fg="#ef5350")
+                number_label.config(fg="#ef5350")
             else:
-                status_lbl.config(fg="green")
-                num_lbl.config(fg="black")
+                status_label.config(fg=theme["accent"])
+                number_label.config(fg=theme["fg"])
             monitor_win.after(100, update_ui)
 
     update_ui()
@@ -270,21 +428,19 @@ def _create_monitor_win():
 def setup_tray():
     icon_img = load_my_icon()
 
-    def on_quit(icon, item):
+    def on_quit(icon, menu_item):
         global running
         running = False
         icon.stop()
-
         if root:
             root.quit()
-
         time.sleep(0.2)
         os._exit(0)
 
     menu = pystray.Menu(
-        item('Show Monitor', show_monitor),
-        item('Settings', open_settings),
-        item('Exit', on_quit)
+        item("Show Monitor", show_monitor),
+        item("Settings", open_settings),
+        item("Exit", on_quit),
     )
 
     icon = pystray.Icon("BearLimiter", icon_img, "Bear Audio Limiter", menu)
@@ -295,17 +451,13 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
 
-    # Load icon once for the Windows using the updated loader
     my_img = load_my_icon()
     tk_icon = ImageTk.PhotoImage(my_img)
-    
-    # Ensure the root window also has the icon (even if hidden)
     try:
         root.iconphoto(False, tk_icon)
-    except:
+    except Exception:
         pass
 
     threading.Thread(target=limiter_logic, daemon=True).start()
     threading.Thread(target=setup_tray, daemon=True).start()
-
     root.mainloop()
