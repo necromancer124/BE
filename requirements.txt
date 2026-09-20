@@ -2,3 +2,4 @@ pycaw
 comtypes
 pystray
 Pillow
+pywin32

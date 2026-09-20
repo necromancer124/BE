@@ -1,5 +1,6 @@
 from pycaw.pycaw import AudioUtilities, IAudioMeterInformation, ISimpleAudioVolume, IAudioEndpointVolume
 from comtypes import CLSCTX_ALL
+from copy import deepcopy
 import pythoncom
 import time
 import threading
@@ -8,15 +9,28 @@ import json
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
+try:
+    import win32gui
+    import win32ui
+except Exception:
+    win32gui = None
+    win32ui = None
 import pystray
 from pystray import MenuItem as item
 import sys
 
 from bear_settings import (
     DEFAULT_CONFIG,
+    PROTECTION_SETTING_KEYS,
     app_checkbox_text,
+    app_status_icons,
+    app_uses_local_settings,
+    default_selected_apps,
+    effective_app_config,
+    get_app_overrides,
     get_theme,
     normalize_config,
+    save_app_overrides,
     should_limit_app,
 )
 
@@ -76,20 +90,64 @@ def load_my_icon():
 
 
 # --- APP SELECTION ---
-def get_running_audio_apps():
-    """Return the executable names that currently own Windows audio sessions."""
+def get_running_audio_app_details():
+    """Return {exe name: exe path} for Windows audio sessions."""
     pythoncom.CoInitialize()
     try:
-        names = {
-            session.Process.name()
-            for session in AudioUtilities.GetAllSessions()
-            if session.Process
-        }
-        return sorted(names, key=str.casefold)
+        apps = {}
+        for session in AudioUtilities.GetAllSessions():
+            if not session.Process:
+                continue
+            name = session.Process.name()
+            if name not in apps:
+                try:
+                    apps[name] = session.Process.exe()
+                except Exception:
+                    apps[name] = None
+        return dict(sorted(apps.items(), key=lambda item: item[0].casefold()))
     except Exception:
-        return []
+        return {}
     finally:
         pythoncom.CoUninitialize()
+
+
+def get_running_audio_apps():
+    """Return the executable names that currently own Windows audio sessions."""
+    return list(get_running_audio_app_details())
+
+
+def load_app_icon(exe_path, size=40):
+    """Extract a high-resolution executable icon as a Tk image, with a Bear fallback."""
+    fallback = lambda: ImageTk.PhotoImage(load_my_icon().resize((size, size), Image.Resampling.LANCZOS))
+    if not exe_path or not win32gui or not win32ui:
+        return fallback()
+    large_icons = small_icons = []
+    try:
+        large_icons, small_icons = win32gui.ExtractIconEx(exe_path, 0)
+        icons = large_icons or small_icons
+        if not icons:
+            return fallback()
+        hicon = icons[0]
+        hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+        bitmap_dc = hdc.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(hdc, size, size)
+        old_bitmap = bitmap_dc.SelectObject(bitmap)
+        bitmap_dc.FillSolidRect((0, 0, size, size), 0x000000)
+        win32gui.DrawIconEx(bitmap_dc.GetHandleOutput(), 0, 0, hicon, size, size, 0, None, 3)
+        info = bitmap.GetInfo()
+        bits = bitmap.GetBitmapBits(True)
+        image = Image.frombuffer("RGBA", (info["bmWidth"], info["bmHeight"]), bits, "raw", "BGRA", 0, 1)
+        bitmap_dc.SelectObject(old_bitmap)
+        return ImageTk.PhotoImage(image)
+    except Exception:
+        return fallback()
+    finally:
+        for icon in large_icons + small_icons:
+            try:
+                win32gui.DestroyIcon(icon)
+            except Exception:
+                pass
 
 
 # --- THE LOGIC (Prediction & Protection) ---
@@ -117,33 +175,40 @@ def limiter_logic():
                     continue
                 name = session.Process.name()
 
-                # Unselected apps are ignored. If an app was already being defended
-                # when settings changed, let the original recovery logic finish.
-                was_defending = name in app_states and app_states[name][2]
-                if not should_limit_app(name, config) and not was_defending:
+                volume_control = session._ctl.QueryInterface(ISimpleAudioVolume)
+
+                # Unchecked apps must stop being detected/defended immediately,
+                # even if they were in the middle of a defense cycle.
+                if not should_limit_app(name, config):
+                    if name in app_states:
+                        volume_control.SetMute(0, None)
+                        volume_control.SetMasterVolume(app_states[name][0], None)
+                        app_states.pop(name, None)
                     continue
 
+                session_config = effective_app_config(name, config)
                 meter = session._ctl.QueryInterface(IAudioMeterInformation)
-                volume_control = session._ctl.QueryInterface(ISimpleAudioVolume)
 
                 raw_peak = meter.GetPeakValue()
                 app_mixer = volume_control.GetMasterVolume()
                 true_actual = raw_peak * app_mixer * global_master
 
                 if name not in app_states:
-                    app_states[name] = [app_mixer, 0, False, 0]
+                    app_states[name] = [app_mixer, 0, False, 0, session_config["THRESHOLD"]]
+                elif len(app_states[name]) < 5:
+                    app_states[name].append(session_config["THRESHOLD"])
 
-                if not app_states[name][2] and true_actual > config["THRESHOLD"]:
+                if not app_states[name][2] and true_actual > session_config["THRESHOLD"]:
                     app_states[name][0] = app_mixer
                     app_states[name][1] = time.time()
                     app_states[name][2] = True
-                    if config["USE_MUTE"]:
+                    app_states[name][4] = session_config["THRESHOLD"]
+                    if session_config["USE_MUTE"]:
                         volume_control.SetMute(1, None)
                     else:
-                        volume_control.SetMasterVolume(config["LOWER_PERCENT"], None)
+                        volume_control.SetMasterVolume(session_config["LOWER_PERCENT"], None)
 
                 if app_states[name][2]:
-                    is_defending = True
                     elapsed = time.time() - app_states[name][1]
                     potential_volume = raw_peak * app_states[name][0] * global_master
 
@@ -151,18 +216,41 @@ def limiter_logic():
                         max_view_level = potential_volume
                         current_loudest = name
 
-                    if potential_volume > config["THRESHOLD"]:
+                    if session_config["USE_MUTE"]:
+                        volume_control.SetMute(1, None)
+                    else:
+                        volume_control.SetMute(0, None)
+                        volume_control.SetMasterVolume(session_config["LOWER_PERCENT"], None)
+
+                    if session_config["THRESHOLD"] > app_states[name][4] and potential_volume <= session_config["THRESHOLD"]:
+                        volume_control.SetMute(0, None)
+                        start_v = max(volume_control.GetMasterVolume(), 0.001)
+                        end_v = app_states[name][0]
+                        for step in range(1, 21):
+                            ratio = step / 20
+                            new_v = start_v * (end_v / start_v) ** ratio
+                            volume_control.SetMasterVolume(new_v, None)
+                            time.sleep(0.001)
+                        app_states[name][2], app_states[name][3] = False, 0
+                        app_states[name][4] = session_config["THRESHOLD"]
+                        continue
+
+                    if potential_volume > session_config["THRESHOLD"]:
+                        is_defending = True
                         app_states[name][1] = time.time()
                         app_states[name][3] = 0
+                        app_states[name][4] = session_config["THRESHOLD"]
+                        continue
 
-                    if elapsed >= config["MUTE_DURATION"]:
-                        if potential_volume < config["SAFE_LEVEL"]:
+                    is_defending = True
+
+                    if elapsed >= session_config["MUTE_DURATION"]:
+                        if potential_volume < session_config["SAFE_LEVEL"]:
                             app_states[name][3] += 1
                             if app_states[name][3] >= 50:
-                                if config["USE_MUTE"]:
-                                    volume_control.SetMute(0, None)
+                                volume_control.SetMute(0, None)
 
-                                start_v = config["LOWER_PERCENT"] if not config["USE_MUTE"] else 0.001
+                                start_v = max(volume_control.GetMasterVolume(), 0.001)
                                 end_v = app_states[name][0]
                                 for step in range(1, 41):
                                     ratio = step / 40
@@ -251,19 +339,129 @@ def open_settings():
     root.after(0, _create_settings_win)
 
 
+def _create_app_settings_win(app_name, refresh_callback=None):
+    """Open the separate local settings menu for one app."""
+    app_win = tk.Toplevel(root)
+    app_win.title(f"Bear App Settings - {app_name}")
+    app_win.geometry("460x520")
+    app_win.minsize(420, 480)
+    app_win.attributes("-topmost", True)
+    app_win.configure(padx=18, pady=14)
+    apply_icon(app_win)
+
+    content = tk.Frame(app_win, padx=12, pady=8)
+    content.pack(fill="both", expand=True)
+
+    tk.Label(content, text=app_name, font=("Arial", 13, "bold")).pack(anchor="w")
+    tk.Label(
+        content,
+        text="Uses the global settings unless you enable a local override below. Changes apply live; they are written to config.json only from the main Save & Close button.",
+        font=("Arial", 8), wraplength=400, justify="left",
+    ).pack(anchor="w", pady=(0, 10))
+
+    local_overrides = get_app_overrides(app_name, config)
+    override_vars = {}
+    value_vars = {}
+
+    def current_overrides():
+        overrides = {}
+        for key in PROTECTION_SETTING_KEYS:
+            if key in override_vars and override_vars[key].get():
+                overrides[key] = value_vars[key].get()
+        return overrides
+
+    def save_local_live():
+        save_app_overrides(app_name, current_overrides(), config)
+
+    def add_local_slider(label_text, key, from_val, to_val, is_percent=True):
+        frame = tk.Frame(content)
+        frame.pack(fill="x", pady=6)
+        override_vars[key] = tk.BooleanVar(value=key in local_overrides)
+        start_value = local_overrides.get(key, config[key])
+        value_vars[key] = tk.DoubleVar(value=start_value)
+        suffix = "%" if is_percent else "s"
+
+        header = tk.Frame(frame)
+        header.pack(fill="x")
+        tk.Checkbutton(header, text="Override", variable=override_vars[key], command=save_local_live, font=("Arial", 8, "bold")).pack(side="left")
+        shown_value = int(start_value * 100) if is_percent else round(start_value, 1)
+        global_value = int(config[key] * 100) if is_percent else round(config[key], 1)
+        label = tk.Label(
+            header,
+            text=f"{label_text}: {shown_value}{suffix}  (global {global_value}{suffix})",
+            font=("Arial", 9, "bold"),
+        )
+        label.pack(side="left", padx=(6, 0))
+
+        def update_label(value):
+            override_vars[key].set(True)
+            parsed_value = max(from_val, min(to_val, float(value)))
+            value_vars[key].set(parsed_value)
+            shown = int(parsed_value * 100) if is_percent else round(parsed_value, 1)
+            label.config(text=f"{label_text}: {shown}{suffix}  (global {global_value}{suffix})")
+            save_local_live()
+
+        ttk.Scale(
+            frame, from_=from_val, to=to_val, variable=value_vars[key],
+            orient="horizontal", command=update_label, style="Bear.Horizontal.TScale",
+        ).pack(fill="x")
+
+    add_local_slider("Trigger Threshold", "THRESHOLD", 0.01, 1.0)
+    add_local_slider("Safe Level", "SAFE_LEVEL", 0.01, 1.0)
+    add_local_slider("Drop Volume To", "LOWER_PERCENT", 0.0, 0.5)
+    add_local_slider("Mute Duration", "MUTE_DURATION", 0.1, 5.0, is_percent=False)
+
+    mute_frame = tk.Frame(content)
+    mute_frame.pack(fill="x", pady=(8, 4))
+    override_vars["USE_MUTE"] = tk.BooleanVar(value="USE_MUTE" in local_overrides)
+    value_vars["USE_MUTE"] = tk.BooleanVar(value=local_overrides.get("USE_MUTE", config["USE_MUTE"]))
+    tk.Checkbutton(mute_frame, text="Override", variable=override_vars["USE_MUTE"], command=save_local_live, font=("Arial", 8, "bold")).pack(side="left")
+
+    def mark_mute_override():
+        override_vars["USE_MUTE"].set(True)
+        save_local_live()
+
+    tk.Checkbutton(
+        mute_frame,
+        text=f"Mute completely on spike (global {'on' if config['USE_MUTE'] else 'off'})",
+        variable=value_vars["USE_MUTE"], command=mark_mute_override, font=("Arial", 9, "bold"),
+    ).pack(side="left", padx=(6, 0))
+
+    def clear_local():
+        save_app_overrides(app_name, {}, config)
+        if refresh_callback:
+            refresh_callback()
+        app_win.destroy()
+
+    def apply_local():
+        save_local_live()
+        if refresh_callback:
+            refresh_callback()
+        app_win.destroy()
+
+    button_row = tk.Frame(content)
+    button_row.pack(fill="x", side="bottom", pady=(12, 0))
+    tk.Button(button_row, text="Use Global Defaults", command=clear_local, font=("Arial", 9, "bold"), pady=8).pack(side="left", fill="x", expand=True, padx=(0, 5))
+    tk.Button(button_row, text="Close", command=apply_local, font=("Arial", 9, "bold"), pady=8).pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+    apply_theme(app_win)
+
+
 def _create_settings_win():
     settings_win = tk.Toplevel(root)
     settings_win.title("Bear Settings")
-    settings_win.geometry("500x700")
-    settings_win.minsize(460, 640)
+    settings_win.geometry("540x740")
+    settings_win.minsize(500, 680)
     settings_win.attributes("-topmost", True)
     settings_win.configure(padx=20, pady=16)
     apply_icon(settings_win)
+    original_config = deepcopy(config)
+    saved_settings = False
 
     content = tk.Frame(settings_win, padx=12, pady=8)
     content.pack(fill="both", expand=True)
 
-    tk.Label(content, text="Audio protection", font=("Arial", 13, "bold")).pack(anchor="w", pady=(0, 4))
+    tk.Label(content, text="Global audio protection defaults", font=("Arial", 13, "bold")).pack(anchor="w", pady=(0, 4))
 
     def add_setting(label_text, key, from_val, to_val, is_percent=True):
         frame = tk.Frame(content)
@@ -291,21 +489,20 @@ def _create_settings_win():
     add_setting("Mute Duration (Seconds)", "MUTE_DURATION", 0.1, 5.0, is_percent=False)
 
     mute_var = tk.BooleanVar(value=config["USE_MUTE"])
+
+    def toggle_mute():
+        config["USE_MUTE"] = mute_var.get()
+
     tk.Checkbutton(
-        content, text="Mute completely on spike", variable=mute_var, font=("Arial", 9),
+        content, text="Mute completely on spike", variable=mute_var, command=toggle_mute, font=("Arial", 9),
     ).pack(anchor="w", pady=(6, 8))
 
     tk.Label(content, text="App selection", font=("Arial", 13, "bold")).pack(anchor="w", pady=(4, 2))
     only_selected_var = tk.BooleanVar(value=config["LIMIT_ONLY_SELECTED"])
-    tk.Checkbutton(
-        content,
-        text="Only limit the apps selected below",
-        variable=only_selected_var,
-        font=("Arial", 9, "bold"),
-    ).pack(anchor="w")
+
     tk.Label(
         content,
-        text="Open an app that plays audio and it will appear here. Selections are saved for next time.",
+        text="Open an app that plays audio and it will appear here. Each app starts with the global defaults. Use App Settings to save only local overrides for that app.",
         font=("Arial", 8), wraplength=430, justify="left",
     ).pack(anchor="w", pady=(0, 5))
 
@@ -329,70 +526,184 @@ def _create_settings_win():
 
     shown_apps = []
     app_vars = {}
+    app_rows = {}
+    app_icons = {}
+    def mark_live():
+        """Settings are applied in memory immediately; disk save waits for Save & Close."""
+        return None
 
-    def populate_apps():
-        nonlocal shown_apps, app_vars
-        selected_folded = {
-            name.casefold() for name, variable in app_vars.items() if variable.get()
-        }
-        if not app_vars:
-            selected_folded.update(name.casefold() for name in config.get("SELECTED_APPS", []))
+    def selected_app_names():
+        return [name for name in shown_apps if app_vars.get(name) and app_vars[name].get()]
 
-        running_apps = get_running_audio_apps()
-        shown_apps = sorted(
-            set(running_apps) | set(config.get("SELECTED_APPS", [])), key=str.casefold,
+    def save_selection_live():
+        config["LIMIT_ONLY_SELECTED"] = only_selected_var.get()
+        config["SELECTED_APPS"] = selected_app_names()
+        mark_live()
+
+    def update_app_row(app_name):
+        row = app_rows.get(app_name)
+        if not row:
+            return
+        selected = app_vars[app_name].get()
+        has_local_settings = app_uses_local_settings(app_name, config)
+        theme = get_theme(dark_var.get())
+        row_bg = theme["select_bg"] if selected else theme["surface"]
+        row["frame"].configure(bg=row_bg)
+        row["icon"].configure(bg=row_bg)
+        row["status"].configure(bg=row_bg, text=app_status_icons(row["is_running"], has_local_settings))
+        row["button"].configure(
+            text=app_checkbox_text(
+                app_name,
+                selected,
+                row["is_running"],
+                has_local_settings,
+            ),
+            bg=row_bg,
+            activebackground=row_bg,
         )
-        running_folded = {name.casefold() for name in running_apps}
+
+    def on_app_toggled(app_name):
+        update_app_row(app_name)
+        save_selection_live()
+
+    def populate_apps(force=False):
+        nonlocal shown_apps, app_vars
+        selected_folded = {name.casefold() for name, variable in app_vars.items() if variable.get()}
+        running_details = get_running_audio_app_details()
+        new_shown_apps = sorted(
+            set(running_details) | set(config.get("SELECTED_APPS", [])) | set(config.get("APP_SETTINGS", {}).keys()),
+            key=str.casefold,
+        )
+        if not app_vars:
+            initial_selected = default_selected_apps(new_shown_apps, config) if only_selected_var.get() else config.get("SELECTED_APPS", [])
+            selected_folded = {name.casefold() for name in initial_selected}
+
+        old_state = [
+            (name, app_rows[name]["is_running"], app_uses_local_settings(name, config))
+            for name in shown_apps
+            if name in app_rows
+        ]
+        new_running_folded = {name.casefold() for name in running_details}
+        new_state = [
+            (name, name.casefold() in new_running_folded, app_uses_local_settings(name, config))
+            for name in new_shown_apps
+        ]
+        if not force and new_shown_apps == shown_apps and old_state == new_state:
+            for name in shown_apps:
+                update_app_row(name)
+            return
 
         for child in checklist_frame.winfo_children():
             child.destroy()
+        shown_apps = new_shown_apps
         app_vars = {}
+        app_rows.clear()
+        app_icons.clear()
 
         for app_name in shown_apps:
-            is_running = app_name.casefold() in running_folded
+            is_running = app_name.casefold() in new_running_folded
             variable = tk.BooleanVar(value=app_name.casefold() in selected_folded)
             app_vars[app_name] = variable
+
+            row_frame = tk.Frame(checklist_frame)
+            row_frame.pack(fill="x", anchor="w", pady=1)
+
+            icon = load_app_icon(running_details.get(app_name))
+            app_icons[app_name] = icon
+            icon_label = tk.Label(row_frame, image=icon, width=48)
+            icon_label.pack(side="left", padx=(2, 8))
+
             row = tk.Checkbutton(
-                checklist_frame, variable=variable, indicatoron=False, anchor="w",
+                row_frame, variable=variable, indicatoron=False, anchor="w",
                 padx=8, pady=4, relief="flat", bd=0, font=("Arial", 9),
+                command=lambda name=app_name: on_app_toggled(name),
             )
-
-            def update_row(button=row, name=app_name, state=variable, running_now=is_running):
-                button.configure(text=app_checkbox_text(name, state.get(), running_now))
-
-            row.configure(command=update_row)
-            update_row()
-            row.pack(fill="x", anchor="w")
+            row.pack(side="left", fill="x", expand=True, anchor="w")
+            status_label = tk.Label(
+                row_frame,
+                width=4,
+                anchor="center",
+                justify="center",
+                font=("Segoe UI Emoji", 16, "bold"),
+            )
+            status_label.pack(side="left", padx=(8, 8))
+            tk.Button(
+                row_frame,
+                text="App Settings",
+                command=lambda name=app_name: _create_app_settings_win(name, lambda: populate_apps(force=True)),
+                font=("Arial", 8),
+                padx=6,
+                pady=3,
+            ).pack(side="right", padx=(5, 0))
+            app_rows[app_name] = {
+                "frame": row_frame,
+                "icon": icon_label,
+                "button": row,
+                "status": status_label,
+                "is_running": is_running,
+            }
+            update_app_row(app_name)
 
         apply_theme(settings_win, dark_var.get())
+        for name in shown_apps:
+            update_app_row(name)
 
     def auto_refresh_apps():
         if settings_win.winfo_exists():
             populate_apps()
             settings_win.after(2000, auto_refresh_apps)
 
-    populate_apps()
-    tk.Button(content, text="Refresh open apps", command=populate_apps).pack(fill="x", pady=(5, 8))
+    def toggle_only_selected():
+        config["LIMIT_ONLY_SELECTED"] = only_selected_var.get()
+        if only_selected_var.get() and not config.get("SELECTED_APPS"):
+            for variable in app_vars.values():
+                variable.set(True)
+        save_selection_live()
+        for name in shown_apps:
+            update_app_row(name)
 
     def preview_theme():
+        config["DARK_MODE"] = dark_var.get()
         apply_theme(settings_win, dark_var.get())
+        for name in shown_apps:
+            update_app_row(name)
+        mark_live()
+
+    only_selected_check = tk.Checkbutton(
+        content,
+        text="Only limit the apps selected below",
+        variable=only_selected_var,
+        command=toggle_only_selected,
+        font=("Arial", 9, "bold"),
+    )
+    only_selected_check.pack(anchor="w")
+
+    populate_apps(force=True)
+    tk.Button(content, text="Refresh open apps", command=lambda: populate_apps(force=True)).pack(fill="x", pady=(5, 8))
 
     tk.Checkbutton(
         content, text="Dark mode", variable=dark_var, command=preview_theme,
         font=("Arial", 9, "bold"),
     ).pack(anchor="w", pady=(0, 5))
 
-    def save():
-        config["USE_MUTE"] = mute_var.get()
-        config["LIMIT_ONLY_SELECTED"] = only_selected_var.get()
-        config["SELECTED_APPS"] = [name for name in shown_apps if app_vars[name].get()]
-        config["DARK_MODE"] = dark_var.get()
+    def save_and_close_settings():
+        nonlocal saved_settings
+        save_selection_live()
+        saved_settings = True
         save_config(config)
         settings_win.destroy()
 
+    def discard_and_close_settings():
+        if not saved_settings:
+            config.clear()
+            config.update(deepcopy(original_config))
+        settings_win.destroy()
+
     tk.Button(
-        content, text="Save & Close", command=save, font=("Arial", 10, "bold"), pady=9,
+        content, text="Save & Close", command=save_and_close_settings, font=("Arial", 10, "bold"), pady=9,
     ).pack(fill="x")
+
+    settings_win.protocol("WM_DELETE_WINDOW", discard_and_close_settings)
 
     apply_theme(settings_win, dark_var.get())
     settings_win.after(2000, auto_refresh_apps)
