@@ -1,0 +1,47 @@
+name: Build and Release Bear Audio Limiter
+
+on:
+  push:
+    branches: [ "windows-master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller pycaw comtypes Pillow pystray pywin32
+
+    - name: Build EXE with Correct Filename
+      # Added .pyw to the end of Bear
+      run: |
+        pyinstaller --noconsole --onefile --add-data "Bear_logo.png;." --add-data "icon.png;." --icon="Bear_logo.png" Bear.pyw
+
+    - name: Automatic Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          dist/Bear.exe
+          Install_Bear.bat
+        tag_name: latest
+        name: Bear Audio Limiter - Stable Build
+        body: |
+          ### 🐾 Bear is ready!
+          1. Download **Bear.exe** and **Install_Bear.bat**.
+          2. Run the .bat file to set up startup.
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
